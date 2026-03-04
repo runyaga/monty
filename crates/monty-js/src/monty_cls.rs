@@ -46,8 +46,9 @@
 use std::borrow::Cow;
 
 use monty::{
-    ExcType, ExternalResult, LimitedTracker, MontyException, MontyObject, MontyRepl as CoreMontyRepl, MontyRun,
-    NoLimitTracker, PrintWriter, PrintWriterCallback, ResourceTracker, RunProgress, Snapshot,
+    ExcType, ExternalResult, FutureSnapshot, LimitedTracker, MontyException, MontyObject,
+    MontyRepl as CoreMontyRepl, MontyRun, NoLimitTracker, PrintWriter, PrintWriterCallback, ResourceTracker,
+    RunProgress, Snapshot,
 };
 use monty_type_checking::{type_check, SourceFile};
 use napi::bindgen_prelude::*;
@@ -307,7 +308,7 @@ impl Monty {
         &self,
         env: &'env Env,
         options: Option<StartOptions<'env>>,
-    ) -> Result<Either3<MontySnapshot, MontyComplete, JsMontyException>> {
+    ) -> Result<Either4<MontySnapshot, MontyComplete, JsMontyException, MontyFutureSnapshot>> {
         let options = options.unwrap_or_default();
         let input_values = self.extract_input_values(options.inputs, *env)?;
 
@@ -330,14 +331,14 @@ impl Monty {
             let tracker = LimitedTracker::new(limits.into());
             let progress = match runner.start(input_values, tracker, &mut print_writer) {
                 Ok(p) => p,
-                Err(exc) => return Ok(Either3::C(JsMontyException::new(exc))),
+                Err(exc) => return Ok(Either4::C(JsMontyException::new(exc))),
             };
             Ok(progress_to_result(progress, print_callback_ref, self.script_name()))
         } else {
             let tracker = NoLimitTracker;
             let progress = match runner.start(input_values, tracker, &mut print_writer) {
                 Ok(p) => p,
-                Err(exc) => return Ok(Either3::C(JsMontyException::new(exc))),
+                Err(exc) => return Ok(Either4::C(JsMontyException::new(exc))),
             };
             Ok(progress_to_result(progress, print_callback_ref, self.script_name()))
         }
@@ -699,6 +700,8 @@ pub struct MontySnapshot {
     script_name: String,
     /// The name of the external function being called.
     function_name: String,
+    /// Unique identifier for this call (used for async correlation).
+    call_id: u32,
     /// The positional arguments passed to the function (stored as MontyObject for serialization).
     args: Vec<MontyObject>,
     /// The keyword arguments passed to the function (stored as MontyObject pairs for serialization).
@@ -754,6 +757,14 @@ impl MontySnapshot {
         self.args.iter().map(|obj| monty_to_js(obj, env)).collect()
     }
 
+    /// Returns the unique call identifier for this external function call.
+    ///
+    /// Used for async correlation when resuming as a future via `resumeAsFuture()`.
+    #[napi(getter)]
+    pub fn call_id(&self) -> u32 {
+        self.call_id
+    }
+
     /// Returns the keyword arguments passed to the external function as an object.
     #[napi(getter)]
     pub fn kwargs<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
@@ -775,13 +786,13 @@ impl MontySnapshot {
     /// Exactly one of `returnValue` or `exception` must be provided.
     ///
     /// @param options - Object with either `returnValue` or `exception`
-    /// @returns MontySnapshot if paused, MontyComplete if done, or MontyException if failed
+    /// @returns MontySnapshot if paused, MontyComplete if done, MontyException if failed, or MontyFutureSnapshot if futures need resolution
     #[napi]
     pub fn resume<'env>(
         &mut self,
         env: &'env Env,
         options: ResumeOptions<'env>,
-    ) -> Result<Either3<Self, MontyComplete, JsMontyException>> {
+    ) -> Result<Either4<Self, MontyComplete, JsMontyException, MontyFutureSnapshot>> {
         // Validate that exactly one of returnValue or exception is provided
         let external_result = match (options.return_value, options.exception) {
             (Some(value), None) => {
@@ -825,14 +836,64 @@ impl MontySnapshot {
             EitherSnapshot::NoLimit(state) => {
                 let progress = match state.run(external_result, &mut print_writer) {
                     Ok(p) => p,
-                    Err(exc) => return Ok(Either3::C(JsMontyException::new(exc))),
+                    Err(exc) => return Ok(Either4::C(JsMontyException::new(exc))),
                 };
                 Ok(progress_to_result(progress, print_callback, self.script_name.clone()))
             }
             EitherSnapshot::Limited(state) => {
                 let progress = match state.run(external_result, &mut print_writer) {
                     Ok(p) => p,
-                    Err(exc) => return Ok(Either3::C(JsMontyException::new(exc))),
+                    Err(exc) => return Ok(Either4::C(JsMontyException::new(exc))),
+                };
+                Ok(progress_to_result(progress, print_callback, self.script_name.clone()))
+            }
+            EitherSnapshot::Done => Err(Error::from_reason("Snapshot has already been resumed")),
+        }
+    }
+
+    /// Resumes execution as a pending future instead of providing a concrete value.
+    ///
+    /// Instead of resolving the external function call immediately, this method tells the
+    /// interpreter to continue execution with the call as a pending future. The code can
+    /// then `await` this future later. If awaited before resolution, execution yields with
+    /// `MontyFutureSnapshot` so the host can resolve all pending futures concurrently.
+    ///
+    /// @returns MontySnapshot if another call is pending, MontyComplete if done,
+    ///          MontyException if failed, or MontyFutureSnapshot if futures need resolution
+    #[napi]
+    pub fn resume_as_future(
+        &mut self,
+        env: &Env,
+    ) -> Result<Either4<Self, MontyComplete, JsMontyException, MontyFutureSnapshot>> {
+        // Take the snapshot, replacing with Done
+        let snapshot = std::mem::replace(&mut self.snapshot, EitherSnapshot::Done);
+
+        // Take the print callback (same borrow-checker dance as resume())
+        let print_callback = std::mem::take(&mut self.print_callback);
+
+        // Build print writer from the callback ref
+        let mut print_cb;
+        let mut print_writer = match &print_callback {
+            Some(func) => {
+                print_cb = CallbackStringPrint::new_js_ref(env, func)?;
+                PrintWriter::Callback(&mut print_cb)
+            }
+            None => PrintWriter::Stdout,
+        };
+
+        // Resume with MontyFuture to push an ExternalFuture and continue execution
+        match snapshot {
+            EitherSnapshot::NoLimit(state) => {
+                let progress = match state.run_pending(&mut print_writer) {
+                    Ok(p) => p,
+                    Err(exc) => return Ok(Either4::C(JsMontyException::new(exc))),
+                };
+                Ok(progress_to_result(progress, print_callback, self.script_name.clone()))
+            }
+            EitherSnapshot::Limited(state) => {
+                let progress = match state.run_pending(&mut print_writer) {
+                    Ok(p) => p,
+                    Err(exc) => return Ok(Either4::C(JsMontyException::new(exc))),
                 };
                 Ok(progress_to_result(progress, print_callback, self.script_name.clone()))
             }
@@ -856,6 +917,7 @@ impl MontySnapshot {
             snapshot: &self.snapshot,
             script_name: &self.script_name,
             function_name: &self.function_name,
+            call_id: self.call_id,
             args: &self.args,
             kwargs: &self.kwargs,
         };
@@ -879,6 +941,7 @@ impl MontySnapshot {
             snapshot: serialized.snapshot,
             script_name: serialized.script_name,
             function_name: serialized.function_name,
+            call_id: serialized.call_id,
             args: serialized.args,
             kwargs: serialized.kwargs,
             print_callback: options
@@ -893,8 +956,8 @@ impl MontySnapshot {
     #[napi]
     pub fn repr(&self) -> String {
         format!(
-            "MontySnapshot(scriptName='{}', functionName='{}', args={:?}, kwargs={:?})",
-            self.script_name, self.function_name, self.args, self.kwargs
+            "MontySnapshot(scriptName='{}', functionName='{}', callId={}, args={:?}, kwargs={:?})",
+            self.script_name, self.function_name, self.call_id, self.args, self.kwargs
         )
     }
 }
@@ -971,41 +1034,40 @@ impl PrintWriterCallback for CallbackStringPrint<'_> {
 // Helper functions for progress conversion
 // =============================================================================
 
-/// Converts a `RunProgress` to either a `MontySnapshot`, `MontyComplete`, or `JsMontyException`.
-///
-/// # Panics
-/// Panics if the progress is `ResolveFutures` - async futures are not yet supported in the JS bindings.
+/// Converts a `RunProgress` to a `MontySnapshot`, `MontyComplete`, `JsMontyException`, or `MontyFutureSnapshot`.
 fn progress_to_result<T>(
     progress: RunProgress<T>,
     print_callback: Option<JsPrintCallbackRef>,
     script_name: String,
-) -> Either3<MontySnapshot, MontyComplete, JsMontyException>
+) -> Either4<MontySnapshot, MontyComplete, JsMontyException, MontyFutureSnapshot>
 where
     T: ResourceTracker + serde::Serialize + serde::de::DeserializeOwned,
     EitherSnapshot: FromSnapshot<T>,
+    EitherFutureSnapshot: FromFutureSnapshot<T>,
 {
     match progress {
-        RunProgress::Complete(result) => Either3::B(MontyComplete { output_value: result }),
+        RunProgress::Complete(result) => Either4::B(MontyComplete { output_value: result }),
         RunProgress::FunctionCall {
             function_name,
             args,
             kwargs,
+            call_id,
             state,
             ..
-        } => {
-            // Store args/kwargs as MontyObject directly for serialization
-            Either3::A(MontySnapshot {
-                snapshot: EitherSnapshot::from_snapshot(state),
-                script_name,
-                function_name,
-                args,
-                kwargs,
-                print_callback,
-            })
-        }
-        RunProgress::ResolveFutures(_) => {
-            panic!("Async futures (ResolveFutures) are not yet supported in the JS bindings")
-        }
+        } => Either4::A(MontySnapshot {
+            snapshot: EitherSnapshot::from_snapshot(state),
+            script_name,
+            function_name,
+            call_id,
+            args,
+            kwargs,
+            print_callback,
+        }),
+        RunProgress::ResolveFutures(future_state) => Either4::D(MontyFutureSnapshot {
+            snapshot: EitherFutureSnapshot::from_future_snapshot(future_state),
+            script_name,
+            print_callback,
+        }),
         RunProgress::OsCall { function, .. } => {
             panic!("OS calls are not yet supported in the JS bindings: {function:?}")
         }
@@ -1026,6 +1088,229 @@ impl FromSnapshot<NoLimitTracker> for EitherSnapshot {
 impl FromSnapshot<LimitedTracker> for EitherSnapshot {
     fn from_snapshot(snapshot: Snapshot<LimitedTracker>) -> Self {
         Self::Limited(snapshot)
+    }
+}
+
+// =============================================================================
+// EitherFutureSnapshot - Internal enum for future snapshot tracker types
+// =============================================================================
+
+/// Runtime future snapshot, wrapping multiple resource tracker types since napi structs can't be generic.
+///
+/// Used internally by `MontyFutureSnapshot` to store execution state while waiting for
+/// external futures to resolve. The `Done` variant indicates the snapshot has been consumed.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum EitherFutureSnapshot {
+    NoLimit(FutureSnapshot<NoLimitTracker>),
+    Limited(FutureSnapshot<LimitedTracker>),
+    /// Done is used when taking the snapshot to run it.
+    /// Should only be set after resume() is called.
+    Done,
+}
+
+/// Trait to convert a typed `FutureSnapshot` into `EitherFutureSnapshot`.
+trait FromFutureSnapshot<T: ResourceTracker> {
+    fn from_future_snapshot(snapshot: FutureSnapshot<T>) -> Self;
+}
+
+impl FromFutureSnapshot<NoLimitTracker> for EitherFutureSnapshot {
+    fn from_future_snapshot(snapshot: FutureSnapshot<NoLimitTracker>) -> Self {
+        Self::NoLimit(snapshot)
+    }
+}
+
+impl FromFutureSnapshot<LimitedTracker> for EitherFutureSnapshot {
+    fn from_future_snapshot(snapshot: FutureSnapshot<LimitedTracker>) -> Self {
+        Self::Limited(snapshot)
+    }
+}
+
+// =============================================================================
+// MontyFutureSnapshot - Paused execution waiting for futures to resolve
+// =============================================================================
+
+/// Represents paused execution waiting for external futures to resolve.
+///
+/// Unlike `MontySnapshot` (paused at a single function call), this type is returned when
+/// the interpreter has multiple pending async calls that need resolution before execution
+/// can continue. Use `pendingCallIds` to see which calls are pending, then `resume()` to
+/// provide results for some or all of them.
+///
+/// Supports incremental resolution: you don't need to provide all results at once.
+/// Providing partial results yields another `MontyFutureSnapshot` if more are needed.
+#[napi]
+pub struct MontyFutureSnapshot {
+    /// The execution state waiting for future resolution.
+    snapshot: EitherFutureSnapshot,
+    /// Name of the script being executed.
+    script_name: String,
+    /// Optional print callback function.
+    print_callback: Option<JsPrintCallbackRef>,
+}
+
+/// A single result item for resuming a `MontyFutureSnapshot`.
+///
+/// Exactly one of `returnValue` or `exception` must be provided per item.
+#[napi(object)]
+pub struct FutureResumeItem<'env> {
+    /// The call_id this result corresponds to.
+    pub call_id: u32,
+    /// The return value for the call (mutually exclusive with `exception`).
+    pub return_value: Option<Unknown<'env>>,
+    /// An exception to raise for the call (mutually exclusive with `returnValue`).
+    pub exception: Option<ExceptionInput>,
+}
+
+#[napi]
+impl MontyFutureSnapshot {
+    /// Returns the call IDs of all pending external futures.
+    #[napi(getter)]
+    pub fn pending_call_ids(&self) -> Result<Vec<u32>> {
+        match &self.snapshot {
+            EitherFutureSnapshot::NoLimit(state) => Ok(state.pending_call_ids().to_vec()),
+            EitherFutureSnapshot::Limited(state) => Ok(state.pending_call_ids().to_vec()),
+            EitherFutureSnapshot::Done => Err(Error::from_reason("FutureSnapshot has already been resumed")),
+        }
+    }
+
+    /// Resumes execution with results for some or all pending futures.
+    ///
+    /// Each item must provide exactly one of `returnValue` or `exception`.
+    /// If results for only some pending calls are provided, execution continues
+    /// until blocked again, potentially returning another `MontyFutureSnapshot`.
+    ///
+    /// @param results - Array of `{ callId, returnValue?, exception? }` items
+    /// @returns MontySnapshot, MontyComplete, MontyException, or another MontyFutureSnapshot
+    #[napi]
+    pub fn resume<'env>(
+        &mut self,
+        env: &'env Env,
+        results: Vec<FutureResumeItem<'env>>,
+    ) -> Result<Either4<MontySnapshot, MontyComplete, JsMontyException, Self>> {
+        // Convert JS results to Rust (call_id, ExternalResult) pairs
+        let mut resume_results = Vec::with_capacity(results.len());
+        for item in results {
+            let external_result = match (item.return_value, item.exception) {
+                (Some(value), None) => {
+                    let monty_value = js_to_monty(value, *env)?;
+                    ExternalResult::Return(monty_value)
+                }
+                (None, Some(exc)) => {
+                    let monty_exc = MontyException::new(string_to_exc_type(&exc.r#type)?, Some(exc.message));
+                    ExternalResult::Error(monty_exc)
+                }
+                (Some(_), Some(_)) => {
+                    return Err(Error::from_reason(format!(
+                        "FutureResumeItem for callId {} has both returnValue and exception",
+                        item.call_id
+                    )));
+                }
+                (None, None) => {
+                    return Err(Error::from_reason(format!(
+                        "FutureResumeItem for callId {} has neither returnValue nor exception",
+                        item.call_id
+                    )));
+                }
+            };
+            resume_results.push((item.call_id, external_result));
+        }
+
+        // Take the snapshot, replacing with Done
+        let snapshot = std::mem::replace(&mut self.snapshot, EitherFutureSnapshot::Done);
+
+        // Take the print callback (same borrow-checker dance as MontySnapshot)
+        let print_callback = std::mem::take(&mut self.print_callback);
+
+        // Build print writer from the callback ref
+        let mut print_cb;
+        let mut print_writer = match &print_callback {
+            Some(func) => {
+                print_cb = CallbackStringPrint::new_js_ref(env, func)?;
+                PrintWriter::Callback(&mut print_cb)
+            }
+            None => PrintWriter::Stdout,
+        };
+
+        // Resume based on tracker type
+        match snapshot {
+            EitherFutureSnapshot::NoLimit(state) => {
+                let progress = match state.resume(resume_results, &mut print_writer) {
+                    Ok(p) => p,
+                    Err(exc) => return Ok(Either4::C(JsMontyException::new(exc))),
+                };
+                Ok(progress_to_result(progress, print_callback, self.script_name.clone()))
+            }
+            EitherFutureSnapshot::Limited(state) => {
+                let progress = match state.resume(resume_results, &mut print_writer) {
+                    Ok(p) => p,
+                    Err(exc) => return Ok(Either4::C(JsMontyException::new(exc))),
+                };
+                Ok(progress_to_result(progress, print_callback, self.script_name.clone()))
+            }
+            EitherFutureSnapshot::Done => Err(Error::from_reason("FutureSnapshot has already been resumed")),
+        }
+    }
+
+    /// Returns the name of the script being executed.
+    #[napi(getter)]
+    pub fn script_name(&self) -> String {
+        self.script_name.clone()
+    }
+
+    /// Serializes the `MontyFutureSnapshot` to a binary format.
+    ///
+    /// @returns Buffer containing the serialized future snapshot
+    #[napi]
+    pub fn dump(&self) -> Result<Buffer> {
+        if matches!(self.snapshot, EitherFutureSnapshot::Done) {
+            return Err(Error::from_reason(
+                "Cannot dump future snapshot that has already been resumed",
+            ));
+        }
+
+        let serialized = SerializedFutureSnapshot {
+            snapshot: &self.snapshot,
+            script_name: &self.script_name,
+        };
+
+        let bytes =
+            postcard::to_allocvec(&serialized).map_err(|e| Error::from_reason(format!("Serialization failed: {e}")))?;
+        Ok(Buffer::from(bytes))
+    }
+
+    /// Deserializes a `MontyFutureSnapshot` from binary format.
+    ///
+    /// @param data - The serialized data from `dump()`
+    /// @param options - Optional load options (for print callback)
+    /// @returns A new MontyFutureSnapshot instance
+    #[napi(factory)]
+    pub fn load(data: Buffer, options: Option<SnapshotLoadOptions>) -> Result<Self> {
+        let serialized: SerializedFutureSnapshotOwned =
+            postcard::from_bytes(&data).map_err(|e| Error::from_reason(format!("Deserialization failed: {e}")))?;
+
+        Ok(Self {
+            snapshot: serialized.snapshot,
+            script_name: serialized.script_name,
+            print_callback: options
+                .as_ref()
+                .and_then(|t| t.print_callback.as_ref())
+                .map(Function::create_ref)
+                .transpose()?,
+        })
+    }
+
+    /// Returns a string representation of the `MontyFutureSnapshot`.
+    #[napi]
+    pub fn repr(&self) -> String {
+        let call_ids = match &self.snapshot {
+            EitherFutureSnapshot::NoLimit(state) => format!("{:?}", state.pending_call_ids()),
+            EitherFutureSnapshot::Limited(state) => format!("{:?}", state.pending_call_ids()),
+            EitherFutureSnapshot::Done => "Done".to_string(),
+        };
+        format!(
+            "MontyFutureSnapshot(scriptName='{}', pendingCallIds={})",
+            self.script_name, call_ids
+        )
     }
 }
 
@@ -1069,6 +1354,7 @@ struct SerializedSnapshot<'a> {
     snapshot: &'a EitherSnapshot,
     script_name: &'a str,
     function_name: &'a str,
+    call_id: u32,
     args: &'a [MontyObject],
     kwargs: &'a [(MontyObject, MontyObject)],
 }
@@ -1079,8 +1365,23 @@ struct SerializedSnapshotOwned {
     snapshot: EitherSnapshot,
     script_name: String,
     function_name: String,
+    call_id: u32,
     args: Vec<MontyObject>,
     kwargs: Vec<(MontyObject, MontyObject)>,
+}
+
+/// Serialization wrapper for `MontyFutureSnapshot` using borrowed references.
+#[derive(serde::Serialize)]
+struct SerializedFutureSnapshot<'a> {
+    snapshot: &'a EitherFutureSnapshot,
+    script_name: &'a str,
+}
+
+/// Owned version of `SerializedFutureSnapshot` for deserialization.
+#[derive(serde::Deserialize)]
+struct SerializedFutureSnapshotOwned {
+    snapshot: EitherFutureSnapshot,
+    script_name: String,
 }
 
 // =============================================================================

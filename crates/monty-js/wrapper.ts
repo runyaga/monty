@@ -5,6 +5,7 @@ import type {
   ExceptionInfo,
   ExceptionInput,
   Frame,
+  FutureResumeItem,
   JsMontyObject,
   MontyOptions,
   ResourceLimits,
@@ -21,6 +22,7 @@ import {
   MontyComplete as NativeMontyComplete,
   MontyException as NativeMontyException,
   MontyTypingError as NativeMontyTypingError,
+  MontyFutureSnapshot as NativeMontyFutureSnapshot,
 } from './index.js'
 
 export type {
@@ -33,6 +35,7 @@ export type {
   ResumeOptions,
   ExceptionInput,
   SnapshotLoadOptions,
+  FutureResumeItem,
   JsMontyObject,
 }
 
@@ -303,15 +306,16 @@ export class Monty {
   }
 
   /**
-   * Starts execution and returns either a snapshot (paused at external call) or completion.
+   * Starts execution and returns a snapshot (paused at external call), completion, or future snapshot.
    *
    * @param options - Execution options (inputs, limits)
-   * @returns MontySnapshot if an external function call is pending, MontyComplete if done
+   * @returns MontySnapshot if an external function call is pending, MontyComplete if done,
+   *          or MontyFutureSnapshot if futures need resolution
    * @throws {MontyRuntimeError} If the code raises an exception
    */
-  start(options?: StartOptions): MontySnapshot | MontyComplete {
+  start(options?: StartOptions): MontySnapshot | MontyComplete | MontyFutureSnapshot {
     const result = this._native.start(options)
-    return wrapStartResult(result)
+    return wrapProgressResult(result)
   }
 
   /**
@@ -415,11 +419,11 @@ export class MontyRepl {
 }
 
 /**
- * Helper to wrap native start/resume results, throwing errors as needed.
+ * Helper to wrap native start/resume progress results, throwing errors as needed.
  */
-function wrapStartResult(
-  result: NativeMontySnapshot | NativeMontyComplete | NativeMontyException,
-): MontySnapshot | MontyComplete {
+function wrapProgressResult(
+  result: NativeMontySnapshot | NativeMontyComplete | NativeMontyException | NativeMontyFutureSnapshot,
+): MontySnapshot | MontyComplete | MontyFutureSnapshot {
   if (result instanceof NativeMontyException) {
     throw new MontyRuntimeError(result)
   }
@@ -428,6 +432,9 @@ function wrapStartResult(
   }
   if (result instanceof NativeMontyComplete) {
     return new MontyComplete(result)
+  }
+  if (result instanceof NativeMontyFutureSnapshot) {
+    return new MontyFutureSnapshot(result)
   }
   throw new Error(`Unexpected result type from native binding: ${result}`)
 }
@@ -455,6 +462,11 @@ export class MontySnapshot {
     return this._native.functionName
   }
 
+  /** Returns the unique call identifier for this external function call. */
+  get callId(): number {
+    return this._native.callId
+  }
+
   /** Returns the positional arguments passed to the external function. */
   get args(): JsMontyObject[] {
     return this._native.args
@@ -469,12 +481,29 @@ export class MontySnapshot {
    * Resumes execution with either a return value or an exception.
    *
    * @param options - Object with either `returnValue` or `exception`
-   * @returns MontySnapshot if another external call is pending, MontyComplete if done
+   * @returns MontySnapshot if another external call is pending, MontyComplete if done,
+   *          or MontyFutureSnapshot if futures need resolution
    * @throws {MontyRuntimeError} If the code raises an exception
    */
-  resume(options: ResumeOptions): MontySnapshot | MontyComplete {
+  resume(options: ResumeOptions): MontySnapshot | MontyComplete | MontyFutureSnapshot {
     const result = this._native.resume(options)
-    return wrapStartResult(result)
+    return wrapProgressResult(result)
+  }
+
+  /**
+   * Resumes execution by marking this call as a pending future.
+   *
+   * Instead of providing a return value now, the interpreter continues execution
+   * with an unresolved future. If the code awaits this future before it is resolved,
+   * execution will yield a `MontyFutureSnapshot`.
+   *
+   * @returns MontySnapshot if another call is pending, MontyComplete if done,
+   *          or MontyFutureSnapshot if futures need resolution
+   * @throws {MontyRuntimeError} If the code raises an exception
+   */
+  resumeAsFuture(): MontySnapshot | MontyComplete | MontyFutureSnapshot {
+    const result = this._native.resumeAsFuture()
+    return wrapProgressResult(result)
   }
 
   /**
@@ -493,6 +522,70 @@ export class MontySnapshot {
   }
 
   /** Returns a string representation of the MontySnapshot. */
+  repr(): string {
+    return this._native.repr()
+  }
+}
+
+/**
+ * Represents paused execution waiting for external futures to resolve.
+ *
+ * Unlike `MontySnapshot` (paused at a single function call), this type is returned when
+ * the interpreter has multiple pending async calls that need resolution. Use `pendingCallIds`
+ * to see which calls need results, then `resume()` to provide them.
+ *
+ * Supports incremental resolution: providing partial results yields another
+ * `MontyFutureSnapshot` if more calls are still pending.
+ */
+export class MontyFutureSnapshot {
+  private _native: NativeMontyFutureSnapshot
+
+  constructor(nativeFutureSnapshot: NativeMontyFutureSnapshot) {
+    this._native = nativeFutureSnapshot
+  }
+
+  /** Returns the name of the script being executed. */
+  get scriptName(): string {
+    return this._native.scriptName
+  }
+
+  /** Returns the call IDs of all pending external futures. */
+  get pendingCallIds(): number[] {
+    return this._native.pendingCallIds
+  }
+
+  /**
+   * Resumes execution with results for some or all pending futures.
+   *
+   * Each item must provide exactly one of `returnValue` or `exception`.
+   * If results for only some pending calls are provided, execution continues
+   * until blocked again, potentially returning another `MontyFutureSnapshot`.
+   *
+   * @param results - Array of `{ callId, returnValue?, exception? }` items
+   * @returns MontySnapshot, MontyComplete, or another MontyFutureSnapshot
+   * @throws {MontyRuntimeError} If the code raises an exception
+   */
+  resume(results: FutureResumeItem[]): MontySnapshot | MontyComplete | MontyFutureSnapshot {
+    const result = this._native.resume(results)
+    return wrapProgressResult(result)
+  }
+
+  /**
+   * Serializes the MontyFutureSnapshot to a binary format.
+   */
+  dump(): Buffer {
+    return this._native.dump()
+  }
+
+  /**
+   * Deserializes a MontyFutureSnapshot from binary format.
+   */
+  static load(data: Buffer, options?: SnapshotLoadOptions): MontyFutureSnapshot {
+    const nativeFutureSnapshot = NativeMontyFutureSnapshot.load(data, options)
+    return new MontyFutureSnapshot(nativeFutureSnapshot)
+  }
+
+  /** Returns a string representation of the MontyFutureSnapshot. */
   repr(): string {
     return this._native.repr()
   }
@@ -536,76 +629,75 @@ export interface RunMontyAsyncOptions {
  *
  * This function handles both synchronous and asynchronous external functions.
  * When an external function returns a Promise, it will be awaited before
- * resuming execution.
+ * resuming execution. External calls are resolved sequentially.
+ *
+ * For concurrent resolution of multiple async calls (e.g., via `asyncio.gather`),
+ * use the lower-level `MontySnapshot.resumeAsFuture()` and `MontyFutureSnapshot.resume()`
+ * APIs to build a custom execution loop.
  *
  * @param montyRunner - The Monty runner instance to execute
  * @param options - Execution options
  * @returns The output of the Monty script
  * @throws {MontyRuntimeError} If the code raises an exception
  * @throws {MontySyntaxError} If the code has syntax errors
- *
- * @example
- * const m = new Monty('result = await fetch_data(url)', {
- *   inputs: ['url'],
- *   externalFunctions: ['fetch_data']
- * });
- *
- * const result = await runMontyAsync(m, {
- *   inputs: { url: 'https://example.com' },
- *   externalFunctions: {
- *     fetch_data: async (url) => {
- *       const response = await fetch(url);
- *       return response.text();
- *     }
- *   }
- * });
  */
 export async function runMontyAsync(montyRunner: Monty, options: RunMontyAsyncOptions = {}): Promise<JsMontyObject> {
   const { inputs, externalFunctions = {}, limits } = options
 
-  let progress: MontySnapshot | MontyComplete = montyRunner.start({
+  let progress: MontySnapshot | MontyComplete | MontyFutureSnapshot = montyRunner.start({
     inputs,
     limits,
   })
 
-  while (progress instanceof MontySnapshot) {
-    const snapshot = progress
-    const funcName = snapshot.functionName
-    const extFunction = externalFunctions[funcName]
+  while (progress instanceof MontySnapshot || progress instanceof MontyFutureSnapshot) {
+    if (progress instanceof MontySnapshot) {
+      const snapshot = progress
+      const funcName = snapshot.functionName
+      const extFunction = externalFunctions[funcName]
 
-    if (!extFunction) {
-      // Function not found - resume with a KeyError exception
-      progress = snapshot.resume({
-        exception: {
-          type: 'KeyError',
-          message: `"External function '${funcName}' not found"`,
-        },
-      })
-      continue
-    }
-
-    try {
-      // Call the external function
-      let result = extFunction(...snapshot.args, snapshot.kwargs)
-
-      // If the result is a Promise, await it
-      if (result && typeof (result as Promise<unknown>).then === 'function') {
-        result = await result
+      if (!extFunction) {
+        // Function not found - resume with a KeyError exception
+        progress = snapshot.resume({
+          exception: {
+            type: 'KeyError',
+            message: `"External function '${funcName}' not found"`,
+          },
+        })
+        continue
       }
 
-      // Resume with the return value
-      progress = snapshot.resume({ returnValue: result })
-    } catch (error) {
-      // External function threw an exception - convert to Monty exception
-      const err = error as Error
-      const excType = err.name || 'RuntimeError'
-      const excMessage = err.message || String(error)
-      progress = snapshot.resume({
-        exception: {
-          type: excType,
-          message: excMessage,
-        },
-      })
+      try {
+        // Call the external function
+        let result = extFunction(...snapshot.args, snapshot.kwargs)
+
+        // If the result is a Promise, await it
+        if (result && typeof (result as Promise<unknown>).then === 'function') {
+          result = await result
+        }
+
+        // Resume with the return value
+        progress = snapshot.resume({ returnValue: result })
+      } catch (error) {
+        // External function threw an exception - convert to Monty exception
+        const err = error as Error
+        const excType = err.name || 'RuntimeError'
+        const excMessage = err.message || String(error)
+        progress = snapshot.resume({
+          exception: {
+            type: excType,
+            message: excMessage,
+          },
+        })
+      }
+    } else {
+      // MontyFutureSnapshot - this can occur if Python code internally uses
+      // async patterns (e.g., asyncio.gather with coroutines that await external futures).
+      // Since we resolve all external calls synchronously above, this is an unexpected state.
+      throw new MontyRuntimeError(
+        'RuntimeError',
+        'runMontyAsync does not support concurrent futures. ' +
+          'Use the low-level MontySnapshot.resumeAsFuture() and MontyFutureSnapshot.resume() APIs instead.',
+      )
     }
   }
 

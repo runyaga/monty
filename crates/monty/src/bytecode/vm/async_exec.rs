@@ -778,12 +778,11 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 gather.results[result_idx] = Some(value); // Move value directly, no clone needed
                 // Remove from pending_calls
                 gather.pending_calls.retain(|&cid| cid != call_id);
-                // Take task_ids to avoid clone - we're checking completion so gather may be destroyed
-                (
-                    gather.pending_calls.is_empty(),
-                    std::mem::take(&mut gather.task_ids),
-                    gather.waiter,
-                )
+                // Clone task_ids — we can't use mem::take because if the gather is NOT
+                // complete, the empty task_ids would persist. Later, handle_task_completion
+                // reads gather.task_ids to check all_tasks_complete, and an empty vec
+                // makes it vacuously true, falsely completing the gather with None results.
+                (gather.pending_calls.is_empty(), gather.task_ids.clone(), gather.waiter)
             } else {
                 (true, vec![], None)
             };
@@ -956,6 +955,14 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     /// # Returns
     /// `true` if a value was pushed, `false` if no task was ready to continue.
     pub fn prepare_current_task_after_resolve(&mut self) -> bool {
+        // If frames are empty, the current task's context was saved to the scheduler
+        // during a previous partial resume (e.g., load_ready_task_if_needed drained
+        // frames when the task was blocked). We can't push a resolved value onto an
+        // empty stack — the task must be loaded via load_ready_task_if_needed instead.
+        if self.frames.is_empty() {
+            return false;
+        }
+
         let Some(scheduler) = &mut self.scheduler else {
             return false;
         };
