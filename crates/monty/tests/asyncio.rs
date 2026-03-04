@@ -539,6 +539,62 @@ fn incremental_resolution_error_on_second_round() {
     assert_eq!(exc.message(), Some("delayed failure"));
 }
 
+// === Test: Partial resolution with mixed coroutine task + direct external call ===
+// This reproduces a panic ("no active frame") when a gather mixes a coroutine
+// task (which itself awaits an external call) with a direct external call,
+// and only the task's external call is resolved first.
+
+#[test]
+fn gather_mixed_coroutine_and_direct_external_partial_resolve() {
+    let code = r"
+import asyncio
+
+async def double(x):
+    val = await async_call(x)
+    return val * 2
+
+results = await asyncio.gather(double(5), async_call(100))
+results
+";
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
+
+    let progress = runner.start(vec![], NoLimitTracker, &mut PrintWriter::Stdout).unwrap();
+
+    // Use drive_collecting_calls so we know which call_id maps to which invocation.
+    // Call order: async_call(100) (gather direct) then async_call(5) (double's inner).
+    let (state, calls) = drive_collecting_calls(progress);
+    assert_eq!(calls.len(), 2, "should have 2 external calls");
+    assert_eq!(state.pending_call_ids().len(), 2, "should have 2 pending calls");
+
+    // Resolve the gather's direct external call first: async_call(100) → returns 100.
+    // This is a partial resolution — double(5) is still blocked on its own async_call(5).
+    let results = vec![(calls[0].0, ExtFunctionResult::Return(MontyObject::Int(100)))];
+    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+
+    // Should return ResolveFutures with the remaining call (async_call(5) for double)
+    let state = progress
+        .into_resolve_futures()
+        .expect("should need more futures (double's async_call(5) still pending)");
+
+    assert_eq!(
+        state.pending_call_ids().len(),
+        1,
+        "should have 1 remaining pending call"
+    );
+
+    // Resolve double's inner call: async_call(5) → returns 5.
+    // double(5) will then compute 5 * 2 = 10.
+    let results = vec![(calls[1].0, ExtFunctionResult::Return(MontyObject::Int(5)))];
+    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+
+    // gather(double(5), async_call(100)) = [10, 100]
+    let result = progress.into_complete().expect("should complete");
+    assert_eq!(
+        result,
+        MontyObject::List(vec![MontyObject::Int(10), MontyObject::Int(100)])
+    );
+}
+
 // === Test: Gather with all at once, mixed success/failure ===
 
 #[test]
@@ -608,6 +664,85 @@ fn drive_collecting_calls<T: monty::ResourceTracker>(
             }
         }
     }
+}
+
+// === Test: mem::take corruption in resolve_future gather path (3-item gather) ===
+// This test targets the data corruption caused by `std::mem::take(&mut gather.task_ids)`
+// in resolve_future(). With 3 items (2 coroutines + 1 direct external), resolving the
+// direct external first empties gather.task_ids. When a coroutine completes later,
+// handle_task_completion reads the empty task_ids and falsely considers the gather
+// complete, panicking on None for the unfinished coroutine's result.
+//
+// Resolution order that triggers the bug:
+// 1. Resolve C_direct → gather.task_ids corrupted (emptied by mem::take)
+// 2. Resolve slow_a's inner call → slow_a runs to completion
+// 3. handle_task_completion: gather.task_ids = [] → all_tasks_complete = vacuously true
+// 4. Panics on .expect("all results should be filled") because slow_b's result is None
+
+#[test]
+fn gather_three_tasks_with_direct_external_memtake_corruption() {
+    let code = r"
+import asyncio
+
+async def slow_a():
+    val = await async_call(1)
+    return val
+
+async def slow_b():
+    val = await async_call(2)
+    return val
+
+results = await asyncio.gather(slow_a(), slow_b(), async_call(999))
+results
+";
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
+
+    let progress = runner.start(vec![], NoLimitTracker, &mut PrintWriter::Stdout).unwrap();
+
+    let (state, call_ids) = drive_to_resolve_futures(progress);
+    // 3 calls: async_call(999) from gather, async_call(1) from slow_a, async_call(2) from slow_b
+    assert_eq!(call_ids.len(), 3, "should have 3 external calls");
+    assert_eq!(state.pending_call_ids().len(), 3, "should have 3 pending calls");
+
+    // Resolve only the gather's direct external call first (call_ids[0] = async_call(999)).
+    // This triggers mem::take on gather.task_ids, corrupting it to [].
+    let results = vec![(call_ids[0], ExtFunctionResult::Return(MontyObject::Int(999)))];
+    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+
+    let state = progress
+        .into_resolve_futures()
+        .expect("should need more futures (slow_a and slow_b still pending)");
+
+    // Now resolve one coroutine's inner call. This will make that coroutine complete.
+    // With the mem::take bug, handle_task_completion would see gather.task_ids = []
+    // (corrupted) and falsely consider the gather complete, panicking on the other
+    // coroutine's None result.
+    let remaining = state.pending_call_ids();
+    assert_eq!(remaining.len(), 2, "should have 2 remaining calls");
+
+    // Resolve one of the remaining calls (both coroutines return the same value
+    // since call ordering between slow_a/slow_b is nondeterministic)
+    let results = vec![(remaining[0], ExtFunctionResult::Return(MontyObject::Int(42)))];
+    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+
+    // After the first coroutine completes, we should still need the second coroutine's result
+    let state = progress
+        .into_resolve_futures()
+        .expect("should need more futures (one coroutine still pending)");
+
+    assert_eq!(state.pending_call_ids().len(), 1, "should have 1 remaining call");
+
+    // Resolve the last call (same value — both coroutines just return `val`)
+    let last_id = state.pending_call_ids()[0];
+    let results = vec![(last_id, ExtFunctionResult::Return(MontyObject::Int(42)))];
+    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+
+    // Should complete with all three results: [slow_a=42, slow_b=42, direct=999]
+    let result = progress.into_complete().expect("should complete");
+    assert_eq!(
+        result,
+        MontyObject::List(vec![MontyObject::Int(42), MontyObject::Int(42), MontyObject::Int(999),])
+    );
 }
 
 /// Tests nested gathers where spawned tasks do sequential external await then inner gather.
