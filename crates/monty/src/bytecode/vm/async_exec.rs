@@ -778,18 +778,14 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         if let Some((gather_id, result_idx)) = self.scheduler_mut().take_gather_waiter(call_id) {
             // Remove from scheduler's pending_calls so it doesn't appear in get_pending_call_ids()
             self.scheduler_mut().remove_pending_call(call_id);
-            // Store result directly in gather (move, not clone) and check completion
+            // Store result in gather and check completion
             let (pending_empty, task_ids, waiter) =
                 if let HeapDataMut::GatherFuture(gather) = self.heap.get_mut(gather_id) {
-                    gather.results[result_idx] = Some(value); // Move value directly, no clone needed
-                    // Remove from pending_calls
+                    gather.results[result_idx] = Some(value);
                     gather.pending_calls.retain(|&cid| cid != call_id);
-                    // Take task_ids to avoid clone - we're checking completion so gather may be destroyed
-                    (
-                        gather.pending_calls.is_empty(),
-                        std::mem::take(&mut gather.task_ids),
-                        gather.waiter,
-                    )
+                    // Clone task_ids — mem::take would leave an empty vec that makes
+                    // handle_task_completion falsely consider the gather vacuously complete.
+                    (gather.pending_calls.is_empty(), gather.task_ids.clone(), gather.waiter)
                 } else {
                     (true, vec![], None)
                 };
@@ -963,6 +959,12 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     /// # Returns
     /// `true` if a value was pushed, `false` if no task was ready to continue.
     pub fn prepare_current_task_after_resolve(&mut self) -> bool {
+        // If frames were drained during a previous partial resume, fall back to
+        // load_ready_task_if_needed to restore the task context first.
+        if self.frames.is_empty() {
+            return false;
+        }
+
         let Some(scheduler) = &mut self.scheduler else {
             return false;
         };
