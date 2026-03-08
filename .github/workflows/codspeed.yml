@@ -33,7 +33,7 @@ jobs:
         run: rm .cargo/config.toml
 
       - name: Install cargo-codspeed
-        run: cargo install cargo-codspeed
+        uses: taiki-e/install-action@cargo-codspeed
 
       - name: Build benchmarks
         run: cargo codspeed build -p monty --bench main
