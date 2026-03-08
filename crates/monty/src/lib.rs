@@ -6,6 +6,7 @@ mod args;
 mod asyncio;
 mod builtins;
 mod bytecode;
+mod cancellable_tracker;
 mod exception_private;
 mod exception_public;
 mod expressions;
@@ -33,6 +34,7 @@ mod value;
 #[cfg(feature = "ref-count-return")]
 pub use crate::run::RefCountOutput;
 pub use crate::{
+    cancellable_tracker::CancellableTracker,
     exception_private::ExcType,
     exception_public::{CodeLoc, MontyException, StackFrame},
     io::{PrintWriter, PrintWriterCallback},
