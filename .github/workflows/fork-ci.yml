@@ -1,0 +1,145 @@
+name: Fork CI
+
+on:
+  push:
+    branches: [runyaga/main, 'feat/**']
+  pull_request:
+    branches: [runyaga/main]
+
+env:
+  COLUMNS: 150
+  UV_PYTHON: "3.14"
+  UV_FROZEN: "1"
+  DEBUG: "napi:*"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          prefix-key: "v1-rust"
+
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --all-packages --only-dev
+
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit|${{ env.UV_PYTHON }}|${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/monty-js/package-lock.json
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: crates/monty-js
+
+      - run: uvx pre-commit run --color=always --all-files --verbose
+        env:
+          SKIP: no-commit-to-branch
+
+      - name: Show diff on failure
+        if: failure()
+        run: git diff
+
+  test-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - run: rustc --version --verbose
+      - run: python3 -V
+      - run: rm .cargo/config.toml
+
+      # coverage for make test-no-features
+      - run: cargo llvm-cov --no-report -p monty
+      # coverage for make test-ref-count-panic
+      - run: cargo llvm-cov --no-report -p monty --features ref-count-panic
+      # coverage for make test-ref-count-return
+      - run: cargo llvm-cov --no-report -p monty --features ref-count-return
+      # coverage for make test-type-checking
+      - run: cargo llvm-cov --no-report -p monty_type_checking -p monty_typeshed
+      # text report
+      - run: cargo llvm-cov report --ignore-filename-regex '(tests/|test_cases/|/tests\.rs$$)'
+
+  test-js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/monty-js/package-lock.json
+
+      - run: rm .cargo/config.toml
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: crates/monty-js
+
+      - name: Build (debug)
+        run: npm run build:debug
+        working-directory: crates/monty-js
+
+      - name: Test
+        run: npm test
+        working-directory: crates/monty-js
+
+  bench-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - run: rm .cargo/config.toml
+      - run: make dev-bench
+
+  check:
+    if: always()
+    needs: [lint, test-rust, test-js, bench-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether the needed jobs succeeded or failed
+        uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}
