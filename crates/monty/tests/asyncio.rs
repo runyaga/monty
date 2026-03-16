@@ -558,7 +558,7 @@ results
 ";
     let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
 
-    let progress = runner.start(vec![], NoLimitTracker, &mut PrintWriter::Stdout).unwrap();
+    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
 
     // Use drive_collecting_calls so we know which call_id maps to which invocation.
     // Call order: async_call(100) (gather direct) then async_call(5) (double's inner).
@@ -569,7 +569,7 @@ results
     // Resolve the gather's direct external call first: async_call(100) → returns 100.
     // This is a partial resolution — double(5) is still blocked on its own async_call(5).
     let results = vec![(calls[0].0, ExtFunctionResult::Return(MontyObject::Int(100)))];
-    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+    let progress = state.resume(results, PrintWriter::Stdout).unwrap();
 
     // Should return ResolveFutures with the remaining call (async_call(5) for double)
     let state = progress
@@ -585,7 +585,7 @@ results
     // Resolve double's inner call: async_call(5) → returns 5.
     // double(5) will then compute 5 * 2 = 10.
     let results = vec![(calls[1].0, ExtFunctionResult::Return(MontyObject::Int(5)))];
-    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+    let progress = state.resume(results, PrintWriter::Stdout).unwrap();
 
     // gather(double(5), async_call(100)) = [10, 100]
     let result = progress.into_complete().expect("should complete");
@@ -697,7 +697,7 @@ results
 ";
     let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
 
-    let progress = runner.start(vec![], NoLimitTracker, &mut PrintWriter::Stdout).unwrap();
+    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
     // 3 calls: async_call(999) from gather, async_call(1) from slow_a, async_call(2) from slow_b
@@ -707,7 +707,7 @@ results
     // Resolve only the gather's direct external call first (call_ids[0] = async_call(999)).
     // This triggers mem::take on gather.task_ids, corrupting it to [].
     let results = vec![(call_ids[0], ExtFunctionResult::Return(MontyObject::Int(999)))];
-    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+    let progress = state.resume(results, PrintWriter::Stdout).unwrap();
 
     let state = progress
         .into_resolve_futures()
@@ -723,7 +723,7 @@ results
     // Resolve one of the remaining calls (both coroutines return the same value
     // since call ordering between slow_a/slow_b is nondeterministic)
     let results = vec![(remaining[0], ExtFunctionResult::Return(MontyObject::Int(42)))];
-    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+    let progress = state.resume(results, PrintWriter::Stdout).unwrap();
 
     // After the first coroutine completes, we should still need the second coroutine's result
     let state = progress
@@ -735,7 +735,7 @@ results
     // Resolve the last call (same value — both coroutines just return `val`)
     let last_id = state.pending_call_ids()[0];
     let results = vec![(last_id, ExtFunctionResult::Return(MontyObject::Int(42)))];
-    let progress = state.resume(results, &mut PrintWriter::Stdout).unwrap();
+    let progress = state.resume(results, PrintWriter::Stdout).unwrap();
 
     // Should complete with all three results: [slow_a=42, slow_b=42, direct=999]
     let result = progress.into_complete().expect("should complete");
