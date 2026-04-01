@@ -13,12 +13,9 @@
 //! - try/except in 2+ of those loops
 //! - 3rd loop iterates 4+ items
 
-use monty::{
-    CancellableTracker, MontyObject, MontyRun, NameLookupResult, NoLimitTracker, PrintWriter,
-    RunProgress,
-};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
+
+use monty::{CancellableTracker, MontyObject, MontyRun, NameLookupResult, NoLimitTracker, PrintWriter, RunProgress};
 
 /// Drive execution to completion, resolving NameLookups as Undefined
 /// and FunctionCalls with simple returns.
@@ -77,10 +74,7 @@ fn run_via_start_resume(code: &str) -> Result<MontyObject, monty::MontyException
 }
 
 /// Helper: run code via start/resume path with named external functions.
-fn run_via_start_resume_with_ext(
-    code: &str,
-    ext_fns: &[&str],
-) -> Result<MontyObject, monty::MontyException> {
+fn run_via_start_resume_with_ext(code: &str, ext_fns: &[&str]) -> Result<MontyObject, monty::MontyException> {
     let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
     let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout)?;
     drive_to_completion(progress, ext_fns)
@@ -117,10 +111,7 @@ fn drive_to_completion_dartmonty_style(
             }
             RunProgress::FunctionCall(call) => {
                 let mut buf = String::new();
-                progress = call.resume(
-                    MontyObject::None,
-                    PrintWriter::Collect(&mut buf),
-                )?;
+                progress = call.resume(MontyObject::None, PrintWriter::Collect(&mut buf))?;
             }
             RunProgress::ResolveFutures(_) => {
                 panic!("unexpected ResolveFutures");
@@ -134,9 +125,7 @@ fn drive_to_completion_dartmonty_style(
 
 /// Helper: run via start/resume matching dart_monty's EXACT pattern.
 /// Uses CancellableTracker + PrintWriter::Collect with short-lived buffers.
-fn run_via_start_resume_dartmonty_style(
-    code: &str,
-) -> Result<MontyObject, monty::MontyException> {
+fn run_via_start_resume_dartmonty_style(code: &str) -> Result<MontyObject, monty::MontyException> {
     let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let tracker = CancellableTracker::with_flag(NoLimitTracker, cancel_flag);

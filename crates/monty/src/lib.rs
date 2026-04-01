@@ -34,8 +34,8 @@ mod value;
 
 #[cfg(feature = "ref-count-return")]
 pub use crate::run::RefCountOutput;
-pub use crate::cancellable_tracker::CancellableTracker;
 pub use crate::{
+    cancellable_tracker::CancellableTracker,
     exception_private::ExcType,
     exception_public::{CodeLoc, MontyException, StackFrame},
     io::{PrintWriter, PrintWriterCallback},
