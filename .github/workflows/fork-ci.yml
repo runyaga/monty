@@ -2,7 +2,7 @@ name: Fork CI
 
 on:
   push:
-    branches: [runyaga/main, 'feat/**']
+    branches: [runyaga/main, 'runyaga/**', 'feat/**']
   pull_request:
     branches: [runyaga/main]
 
