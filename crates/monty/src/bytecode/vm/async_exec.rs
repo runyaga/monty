@@ -844,6 +844,12 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     /// # Returns
     /// `true` if a value was pushed, `false` if no task was ready to continue.
     pub fn prepare_current_task_after_resolve(&mut self) -> bool {
+        // If frames were drained during a previous partial resume, fall back to
+        // load_ready_task_if_needed to restore the task context first.
+        if self.frames.is_empty() {
+            return false;
+        }
+
         // Check if there's a current task (main or spawned)
         let Some(current_task_id) = self.scheduler.current_task_id() else {
             return false;
