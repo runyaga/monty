@@ -48,7 +48,7 @@ fn drive_to_completion(
                 if call.function_name == "capture" {
                     // Capture the args for verification
                     for arg in &call.args {
-                        print_output.push(format!("{:?}", arg));
+                        print_output.push(format!("{arg:?}"));
                     }
                     progress = call.resume(MontyObject::None, PrintWriter::Stdout)?;
                 } else {
@@ -523,7 +523,7 @@ print = _cw
 /// Run with preamble + CancellableTracker + Collect buffers + __console_write__ as ext fn.
 /// This matches what dart_monty's DefaultMontyBridge actually does.
 fn run_with_preamble(code: &str) -> Result<MontyObject, monty::MontyException> {
-    let full_code = format!("{}\n{}", PREAMBLE, code);
+    let full_code = format!("{PREAMBLE}\n{code}");
     let runner = MontyRun::new(full_code, "test.py", vec![]).unwrap();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let tracker = CancellableTracker::with_flag(NoLimitTracker, cancel_flag);
