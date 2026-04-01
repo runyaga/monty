@@ -514,11 +514,11 @@ fn variant_k_with_ext_fn_via_start_resume() {
 // ---------------------------------------------------------------------------
 
 /// The exact print preamble dart_monty injects (from default_monty_bridge.dart).
-const PREAMBLE: &str = r#"
+const PREAMBLE: &str = r"
 def _cw(*a, sep=' ', end='\n', **k):
     __console_write__(sep.join(str(x) for x in a) + end)
 print = _cw
-"#;
+";
 
 /// Run with preamble + CancellableTracker + Collect buffers + __console_write__ as ext fn.
 /// This matches what dart_monty's DefaultMontyBridge actually does.
