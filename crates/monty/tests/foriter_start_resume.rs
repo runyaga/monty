@@ -13,9 +13,7 @@
 //! - try/except in 2+ of those loops
 //! - 3rd loop iterates 4+ items
 
-use std::sync::{Arc, atomic::AtomicBool};
-
-use monty::{CancellableTracker, MontyObject, MontyRun, NameLookupResult, NoLimitTracker, PrintWriter, RunProgress};
+use monty::{MontyObject, MontyRun, NameLookupResult, NoLimitTracker, PrintWriter, RunProgress};
 
 /// Drive execution to completion, resolving NameLookups as Undefined
 /// and FunctionCalls with simple returns.
@@ -81,11 +79,10 @@ fn run_via_start_resume_with_ext(code: &str, ext_fns: &[&str]) -> Result<MontyOb
 }
 
 /// Drive execution matching dart_monty's handle.rs pattern EXACTLY:
-/// - CancellableTracker wrapping NoLimitTracker
 /// - PrintWriter::Collect with short-lived buffer per NameLookup
 /// - Buffer created and destroyed on each NameLookup iteration
 fn drive_to_completion_dartmonty_style(
-    mut progress: RunProgress<CancellableTracker<NoLimitTracker>>,
+    mut progress: RunProgress<NoLimitTracker>,
     ext_fn_names: &[&str],
 ) -> Result<MontyObject, monty::MontyException> {
     // Initial start() already consumed one PrintWriter::Collect.
@@ -124,15 +121,13 @@ fn drive_to_completion_dartmonty_style(
 }
 
 /// Helper: run via start/resume matching dart_monty's EXACT pattern.
-/// Uses CancellableTracker + PrintWriter::Collect with short-lived buffers.
+/// Uses NoLimitTracker + PrintWriter::Collect with short-lived buffers.
 fn run_via_start_resume_dartmonty_style(code: &str) -> Result<MontyObject, monty::MontyException> {
     let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let tracker = CancellableTracker::with_flag(NoLimitTracker, cancel_flag);
 
     // dart_monty's run_snapshot_op creates a short-lived buffer for start() too
     let mut start_buf = String::new();
-    let progress = runner.start(vec![], tracker, PrintWriter::Collect(&mut start_buf))?;
+    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Collect(&mut start_buf))?;
     // start_buf contents would be drained here in dart_monty
     drive_to_completion_dartmonty_style(progress, &[])
 }
@@ -505,8 +500,8 @@ fn variant_k_with_ext_fn_via_start_resume() {
 }
 
 // ===========================================================================
-// dart_monty-style tests: CancellableTracker + PrintWriter::Collect
-// with short-lived buffers per NameLookup (matching handle.rs exactly)
+// dart_monty-style tests: PrintWriter::Collect with short-lived buffers
+// per NameLookup (matching handle.rs exactly)
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -520,15 +515,13 @@ def _cw(*a, sep=' ', end='\n', **k):
 print = _cw
 ";
 
-/// Run with preamble + CancellableTracker + Collect buffers + __console_write__ as ext fn.
+/// Run with preamble + Collect buffers + __console_write__ as ext fn.
 /// This matches what dart_monty's DefaultMontyBridge actually does.
 fn run_with_preamble(code: &str) -> Result<MontyObject, monty::MontyException> {
     let full_code = format!("{PREAMBLE}\n{code}");
     let runner = MontyRun::new(full_code, "test.py", vec![]).unwrap();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let tracker = CancellableTracker::with_flag(NoLimitTracker, cancel_flag);
     let mut start_buf = String::new();
-    let progress = runner.start(vec![], tracker, PrintWriter::Collect(&mut start_buf))?;
+    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Collect(&mut start_buf))?;
     drive_to_completion_dartmonty_style(progress, &["__console_write__"])
 }
 
