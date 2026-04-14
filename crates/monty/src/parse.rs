@@ -1173,10 +1173,13 @@ impl<'a> Parser<'a> {
     fn parse_identifier(&mut self, ast: AstExpr) -> Result<Identifier, ParseError> {
         match ast {
             AstExpr::Name(ast::ExprName { id, range, .. }) => Ok(self.identifier(&id, range)),
-            other => Err(ParseError::syntax(
-                format!("Expected name, got {other:?}"),
-                self.convert_range(other.range()),
-            )),
+            other => {
+                let range = self.convert_range(other.range());
+                Err(ParseError::syntax(
+                    format!("expected a name, got {}", ast_expr_type_name(&other)),
+                    range,
+                ))
+            }
         }
     }
 
@@ -1274,10 +1277,13 @@ impl<'a> Parser<'a> {
                 }
                 Ok(UnpackTarget::Tuple { targets, position })
             }
-            other => Err(ParseError::syntax(
-                format!("invalid unpacking target: {other:?}"),
-                self.convert_range(other.range()),
-            )),
+            other => {
+                let range = self.convert_range(other.range());
+                Err(ParseError::syntax(
+                    format!("invalid unpacking target: {}", ast_expr_type_name(&other)),
+                    range,
+                ))
+            }
         }
     }
 
@@ -1760,5 +1766,38 @@ fn parse_int_literal(s: &str, position: CodeRange) -> Result<BigInt, ParseError>
         cleaned
             .parse::<BigInt>()
             .map_err(|e| ParseError::syntax(format!("invalid integer literal {s:?}, error: {e}"), position))
+    }
+}
+
+/// Returns a concise, Python-readable description of an AST expression kind.
+///
+/// Used in parse error messages to avoid leaking Rust `Debug` representations
+/// (e.g. `ExprSubscript { node_index: NodeIndex(None), ... }`) into user-visible
+/// error text. All variants produce plain English rather than Rust type names.
+fn ast_expr_type_name(expr: &AstExpr) -> &'static str {
+    match expr {
+        AstExpr::Name(_) => "name",
+        AstExpr::Subscript(_) => "subscript (e.g. arr[i])",
+        AstExpr::Attribute(_) => "attribute access (e.g. obj.attr)",
+        AstExpr::Call(_) => "function call",
+        AstExpr::BinOp(_) => "binary operation",
+        AstExpr::UnaryOp(_) => "unary operation",
+        AstExpr::BoolOp(_) => "boolean operation",
+        AstExpr::Compare(_) => "comparison",
+        AstExpr::If(_) => "conditional expression",
+        AstExpr::Lambda(_) => "lambda",
+        AstExpr::Tuple(_) => "tuple",
+        AstExpr::List(_) => "list",
+        AstExpr::Dict(_) => "dict",
+        AstExpr::Set(_) => "set",
+        AstExpr::ListComp(_) => "list comprehension",
+        AstExpr::SetComp(_) => "set comprehension",
+        AstExpr::DictComp(_) => "dict comprehension",
+        AstExpr::Generator(_) => "generator expression",
+        AstExpr::Await(_) => "await expression",
+        AstExpr::Yield(_) | AstExpr::YieldFrom(_) => "yield expression",
+        AstExpr::Starred(_) => "starred expression",
+        AstExpr::Slice(_) => "slice",
+        _ => "expression",
     }
 }
